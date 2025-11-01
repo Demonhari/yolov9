@@ -15,19 +15,26 @@ from utils.torch_utils import de_parallel
 LOGGERS = ('csv', 'tb', 'wandb', 'clearml', 'comet')  # *.csv, TensorBoard, Weights & Biases, ClearML
 RANK = int(os.getenv('RANK', -1))
 
-try:
-    import wandb
+# --- BEGIN robust wandb import guard ---
+if os.getenv("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
+    wandb = None
+else:
+    try:
+        import wandb  # may fail under py3.12+pydantic mixes
+        assert hasattr(wandb, "__version__")
 
-    assert hasattr(wandb, '__version__')  # verify package import not local dir
-    if pkg.parse_version(wandb.__version__) >= pkg.parse_version('0.12.2') and RANK in {0, -1}:
-        try:
-            wandb_login_success = wandb.login(timeout=30)
-        except wandb.errors.UsageError:  # known non-TTY terminal issue
-            wandb_login_success = False
+        # Don't force-login; if it fails, just disable
+        wandb_login_success = False
+        if RANK in {0, -1}:
+            try:
+                wandb_login_success = wandb.login(timeout=10)
+            except Exception:
+                wandb_login_success = False
         if not wandb_login_success:
             wandb = None
-except (ImportError, AssertionError):
-    wandb = None
+    except BaseException:
+        wandb = None
+# --- END robust wandb import guard ---
 
 try:
     import clearml
@@ -59,6 +66,10 @@ class Loggers():
         self.plots = not opt.noplots  # plot results
         self.logger = logger  # for printing results to console
         self.include = include
+        # Respect WANDB_DISABLED at runtime too
+        if os.getenv("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
+            self.include = tuple(x for x in self.include if x != "wandb")
+
         self.keys = [
             'train/box_loss',
             'train/cls_loss',
