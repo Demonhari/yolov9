@@ -273,28 +273,56 @@ class ComputeLoss:
         imgsz = torch.tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
         anchor_points, stride_tensor = make_anchors(feats_for_anchors, self.stride, 0.5)
         
-        # Tile per level according to na to align with (HW*na) rows we built above
-        # Build per-level slices of anchor_points returned by make_anchors(...)
-        # It returns concatenated points in level order; we reconstruct splits with raw H,W.
+        B = pred_scores.shape[0]
+
         ap_slices, st_slices = [], []
         offset = 0
+
+        # Helper to slice one level depending on dims
+        def _slice_level(ap, st, ofs, hw):
+            if ap.dim() == 2:
+                # (A,2) and (A,1)
+                ap_lvl = ap[ofs:ofs+hw, :]          # (HW, 2)
+                st_lvl = st[ofs:ofs+hw, :]          # (HW, 1)
+            elif ap.dim() == 3:
+                # (B, A, 2) and (B, A, 1)
+                ap_lvl = ap[:, ofs:ofs+hw, :]       # (B, HW, 2)
+                st_lvl = st[:, ofs:ofs+hw, :]       # (B, HW, 1)
+            else:
+                raise RuntimeError(f"Unexpected anchor_points dim={ap.dim()}")
+            return ap_lvl, st_lvl
+
         for lvl, feat in enumerate(feats_for_anchors):
             h, w = feat.shape[2], feat.shape[3]
             hw = h * w
-            ap_lvl = anchor_points[:, offset:offset+hw, :]        # (B, HW, 2)
-            st_lvl = stride_tensor[:, offset:offset+hw, :]        # (B, HW, 1)
+
+            ap_lvl, st_lvl = _slice_level(anchor_points, stride_tensor, offset, hw)
             offset += hw
 
-            na = na_per_level[lvl]
-            if na > 1:
-                ap_lvl = ap_lvl.repeat(1, na, 1)                  # (B, HW*na, 2)
-                st_lvl = st_lvl.repeat(1, na, 1)                  # (B, HW*na, 1)
+            na = na_per_level[lvl] if 'na_per_level' in locals() else 1  # Case A may not set it
+            if ap_lvl.dim() == 2:
+                # (HW,*) -> (HW*na,*)
+                if na > 1:
+                    ap_lvl = ap_lvl.repeat_interleave(na, dim=0)
+                    st_lvl = st_lvl.repeat_interleave(na, dim=0)
+                ap_slices.append(ap_lvl)  # (HW*na, 2)
+                st_slices.append(st_lvl)  # (HW*na, 1)
+            else:
+                # (B, HW,*) -> (B, HW*na,*)
+                if na > 1:
+                    ap_lvl = ap_lvl.repeat(1, na, 1)
+                    st_lvl = st_lvl.repeat(1, na, 1)
+                ap_slices.append(ap_lvl)  # (B, HW*na, 2)
+                st_slices.append(st_lvl)  # (B, HW*na, 1)
 
-            ap_slices.append(ap_lvl)
-            st_slices.append(st_lvl)
-
-        anchor_points = torch.cat(ap_slices, dim=1)               # (B, sum(HW*na), 2)
-        stride_tensor = torch.cat(st_slices, dim=1)               # (B, sum(HW*na), 1)
+        # Concatenate and ensure (B, sum(HW*na), *)
+        if ap_slices[0].dim() == 2:
+            # stack to batch
+            anchor_points = torch.cat(ap_slices, dim=0).unsqueeze(0).expand(B, -1, -1)
+            stride_tensor = torch.cat(st_slices, dim=0).unsqueeze(0).expand(B, -1, -1)
+        else:
+            anchor_points = torch.cat(ap_slices, dim=1)
+            stride_tensor = torch.cat(st_slices, dim=1)               # (B, sum(HW*na), 1)
 
         # targets
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
