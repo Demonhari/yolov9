@@ -153,6 +153,22 @@ class ComputeLoss:
                     out[j, :n] = targets[matches, 1:]
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
+    def _infer_na_nbins(self, ch, nc):
+        # Solve ch = na * (4*nbins + nc)
+        # Try reasonable ranges: na in [1..9], nbins in [8..64]
+        for na in range(1, 13):  # a bit generous
+            rem = ch - na * nc
+            if rem <= 0: 
+                continue
+            if rem % (4 * na) == 0:
+                nbins = rem // (4 * na)
+                if 8 <= nbins <= 64:
+                    return na, nbins
+        # Fallback: assume anchor-free (na=1) and try to back out nbins
+        nbins = (ch - nc) // 4 if (ch - nc) % 4 == 0 else None
+        if nbins is not None and 8 <= nbins <= 64:
+            return 1, nbins
+        raise RuntimeError(f"Cannot infer (na, nbins) from channels={ch}, nc={nc}.")
 
     def bbox_decode(self, anchor_points, pred_dist):
         b, a, c = pred_dist.shape  # (B, HW, 4*nbins)
@@ -216,13 +232,38 @@ class ComputeLoss:
 
         # Layout 3: old style list of fused tensors (channels include dist+cls)
         else:
+            # ----- Adaptive Case B: each level is a single tensor with anchors packed in channels -----
             b = feats[0].shape[0]
-            cat = torch.cat([xi.view(b, self.no, -1) for xi in feats], 2)
-            pred_distri, pred_scores = cat.split((self.reg_max * 4, self.nc), 1)
-            pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (B, HW, nc)
-            pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
+            pd_list, ps_list = []
+            na_per_level, hw_per_level, nbins_per_level = [], [], []
 
-            feats_for_anchors = feats
+            for xi in feats:
+                # xi: (B, C, H, W)
+                _, ch, h, w = xi.shape
+                na, nbins = self._infer_na_nbins(ch, self.nc)   # <- parse anchors & bins
+                c_dist = 4 * nbins * na
+                c_cls  = self.nc * na
+                assert c_dist + c_cls == ch, "channel split mismatch"
+
+                # split channels
+                dist = xi[:, :c_dist, :, :]   # (B, 4*nbins*na, H, W)
+                cls  = xi[:, c_dist:, :, :]   # (B, nc*na,      H, W)
+
+                # reshape to (B, HW*na, …)
+                dist = dist.view(b, na, 4*nbins, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, 4*nbins)
+                cls  = cls.view(b, na, self.nc, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, self.nc)
+
+                pd_list.append(dist)
+                ps_list.append(cls)
+
+                na_per_level.append(na)
+                hw_per_level.append(h * w)
+                nbins_per_level.append(nbins)
+
+            pred_distri = torch.cat(pd_list, dim=1)   # (B, sum(HW*na), 4*nbins_levelwise)  nbins may vary per level (often same)
+            pred_scores = torch.cat(ps_list, dim=1)   # (B, sum(HW*na), nc)
+
+            feats_for_anchors = feats                 # we still use the raw feature maps for H,W extraction
             first_feat = feats[0]
 
 
@@ -231,6 +272,29 @@ class ComputeLoss:
         batch_size, grid_size = pred_scores.shape[:2]
         imgsz = torch.tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
         anchor_points, stride_tensor = make_anchors(feats_for_anchors, self.stride, 0.5)
+        
+        # Tile per level according to na to align with (HW*na) rows we built above
+        # Build per-level slices of anchor_points returned by make_anchors(...)
+        # It returns concatenated points in level order; we reconstruct splits with raw H,W.
+        ap_slices, st_slices = [], []
+        offset = 0
+        for lvl, feat in enumerate(feats_for_anchors):
+            h, w = feat.shape[2], feat.shape[3]
+            hw = h * w
+            ap_lvl = anchor_points[:, offset:offset+hw, :]        # (B, HW, 2)
+            st_lvl = stride_tensor[:, offset:offset+hw, :]        # (B, HW, 1)
+            offset += hw
+
+            na = na_per_level[lvl]
+            if na > 1:
+                ap_lvl = ap_lvl.repeat(1, na, 1)                  # (B, HW*na, 2)
+                st_lvl = st_lvl.repeat(1, na, 1)                  # (B, HW*na, 1)
+
+            ap_slices.append(ap_lvl)
+            st_slices.append(st_lvl)
+
+        anchor_points = torch.cat(ap_slices, dim=1)               # (B, sum(HW*na), 2)
+        stride_tensor = torch.cat(st_slices, dim=1)               # (B, sum(HW*na), 1)
 
         # targets
         targets = self.preprocess(targets, batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
@@ -239,9 +303,13 @@ class ComputeLoss:
 
         # Ensure BboxLoss.reg_max matches current distribution bins (nbins - 1)
         if self.use_dfl:
+            # infer nbins from concatenated pred_distri (it’s levelwise-consistent within each row)
             nbins = pred_distri.shape[-1] // 4
+            if self.proj is None or self.proj.numel() != nbins or self.proj.device != pred_distri.device:
+                self.proj = torch.arange(nbins, device=pred_distri.device).float()
             if self.bbox_loss.reg_max != nbins - 1:
                 self.bbox_loss.reg_max = nbins - 1
+
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
@@ -258,7 +326,7 @@ class ComputeLoss:
 
         # cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
-        loss[1] = self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        loss[1] = self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum
 
         # bbox loss
         if fg_mask.sum():
