@@ -19,10 +19,9 @@ from utils.dataloaders import LoadImagesAndLabels, img2label_paths
 from utils.general import LOGGER, check_dataset, check_file
 
 try:
-    import wandb
-
-    assert hasattr(wandb, '__version__')  # verify package import not local dir
-except (ImportError, AssertionError):
+    import wandb  # may raise many exceptions on py3.12/pydantic mixes
+    assert hasattr(wandb, '__version__')
+except BaseException:  # catch ANY import-time error
     wandb = None
 
 RANK = int(os.getenv('RANK', -1))
