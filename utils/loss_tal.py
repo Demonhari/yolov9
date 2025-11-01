@@ -164,11 +164,46 @@ class ComputeLoss:
 
     def __call__(self, p, targets, img=None, epoch=0):
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+
+        # p can be (pred, aux) tuple; keep original behavior
         feats = p[1] if isinstance(p, tuple) else p
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1)
-        pred_scores = pred_scores.permute(0, 2, 1).contiguous()
-        pred_distri = pred_distri.permute(0, 2, 1).contiguous()
+
+        # --- Normalize outputs and build pred_distri / pred_scores robustly ---
+        # Case A: each level returns a (pred_distri_level, pred_scores_level) pair/list
+        if isinstance(feats[0], (list, tuple)):
+            # Split per level
+            pd_levels = [x[0] for x in feats]  # list of tensors, per-level distribution logits
+            ps_levels = [x[1] for x in feats]  # list of tensors, per-level class logits
+            b = pd_levels[0].shape[0]
+
+            # Reshape to (B, C, H*W) then concat along spatial dimension, then to (B, H*W_all, C)
+            pd_levels = [x.view(b, self.reg_max * 4, -1) for x in pd_levels]
+            ps_levels = [x.view(b, self.nc,           -1) for x in ps_levels]
+
+            pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
+            pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, nc)
+
+            # For anchors/imgsz we need per-level feature tensors with spatial dims:
+            feats_for_anchors = [x[0] for x in feats]  # use the dist branch to read H,W
+            first_feat = feats_for_anchors[0]
+
+        # Case B: old style list of tensors, channels already contain both dist and scores
+        else:
+            b = feats[0].shape[0]
+            cat = torch.cat([xi.view(b, self.no, -1) for xi in feats], 2)
+            pred_distri, pred_scores = cat.split((self.reg_max * 4, self.nc), 1)
+            pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (B, HW, nc)
+            pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
+
+            feats_for_anchors = feats
+            first_feat = feats[0]
+
+        # From here on, the shapes are unified
+        dtype = pred_scores.dtype
+        batch_size, grid_size = pred_scores.shape[:2]
+        imgsz = torch.tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
+        anchor_points, stride_tensor = make_anchors(feats_for_anchors, self.stride, 0.5)
+
 
         dtype = pred_scores.dtype
         batch_size, grid_size = pred_scores.shape[:2]
