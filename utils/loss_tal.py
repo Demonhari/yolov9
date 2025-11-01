@@ -201,12 +201,6 @@ class ComputeLoss:
         # From here on, the shapes are unified
         dtype = pred_scores.dtype
         batch_size, grid_size = pred_scores.shape[:2]
-        imgsz = torch.tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
-        anchor_points, stride_tensor = make_anchors(feats_for_anchors, self.stride, 0.5)
-
-
-        dtype = pred_scores.dtype
-        batch_size, grid_size = pred_scores.shape[:2]
         imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w)
         anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
