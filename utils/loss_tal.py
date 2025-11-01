@@ -136,7 +136,7 @@ class ComputeLoss:
                                             alpha=float(os.getenv('YOLOA', 0.5)),
                                             beta=float(os.getenv('YOLOB', 6.0)))
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
-        self.proj = torch.arange(m.reg_max).float().to(device)  # / 120.0
+        self.proj = None 
         self.use_dfl = use_dfl
 
     def preprocess(self, targets, batch_size, scale_tensor):
@@ -155,11 +155,15 @@ class ComputeLoss:
         return out
 
     def bbox_decode(self, anchor_points, pred_dist):
+        b, a, c = pred_dist.shape  # (B, HW, 4*nbins)
         if self.use_dfl:
-            b, a, c = pred_dist.shape  # batch, anchors, channels
-            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
-            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
+            nbins = c // 4
+            # lazily (re)build proj if needed
+            if (self.proj is None or
+                self.proj.numel() != nbins or
+                self.proj.device != pred_dist.device):
+                self.proj = torch.arange(nbins, device=pred_dist.device).float()
+            pred_dist = pred_dist.view(b, a, 4, nbins).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, p, targets, img=None, epoch=0):
@@ -233,7 +237,12 @@ class ComputeLoss:
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
 
-        # pboxes
+        # Ensure BboxLoss.reg_max matches current distribution bins (nbins - 1)
+        if self.use_dfl:
+            nbins = pred_distri.shape[-1] // 4
+            if self.bbox_loss.reg_max != nbins - 1:
+                self.bbox_loss.reg_max = nbins - 1
+
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
         target_labels, target_bboxes, target_scores, fg_mask = self.assigner(
