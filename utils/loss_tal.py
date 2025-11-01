@@ -180,8 +180,9 @@ class ComputeLoss:
             ps_levels = list(feats[1])
             b = pd_levels[0].shape[0]
 
-            pd_levels = [x.view(b, self.reg_max * 4, -1) for x in pd_levels]
-            ps_levels = [x.view(b, self.nc,           -1) for x in ps_levels]
+            pd_levels = [x.view(b, x.shape[1], -1) for x in pd_levels]  # use real C
+            ps_levels = [x.view(b, x.shape[1], -1) for x in ps_levels]  # use real C (should be nc)
+
 
             pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
             pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, nc)
@@ -199,8 +200,8 @@ class ComputeLoss:
             ps_levels = [x[1] for x in feats]
             b = pd_levels[0].shape[0]
 
-            pd_levels = [x.view(b, self.reg_max * 4, -1) for x in pd_levels]
-            ps_levels = [x.view(b, self.nc,           -1) for x in ps_levels]
+            pd_levels = [x.view(b, x.shape[1], -1) for x in pd_levels]
+            ps_levels = [x.view(b, x.shape[1], -1) for x in ps_levels]
 
             pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()
             pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()
