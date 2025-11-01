@@ -169,25 +169,47 @@ class ComputeLoss:
         feats = p[1] if isinstance(p, tuple) else p
 
         # --- Normalize outputs and build pred_distri / pred_scores robustly ---
-        # Case A: each level returns a (pred_distri_level, pred_scores_level) pair/list
-        if isinstance(feats[0], (list, tuple)):
-            # Split per level
-            pd_levels = [x[0] for x in feats]  # list of tensors, per-level distribution logits
-            ps_levels = [x[1] for x in feats]  # list of tensors, per-level class logits
+        # Layout 1: tuple-of-lists => ([pd_l3,pd_l4,pd_l5], [ps_l3,ps_l4,ps_l5])
+        if (isinstance(feats, (list, tuple))
+            and len(feats) == 2
+            and isinstance(feats[0], (list, tuple))
+            and isinstance(feats[1], (list, tuple))
+            and torch.is_tensor(feats[0][0])
+            and torch.is_tensor(feats[1][0])):
+            pd_levels = list(feats[0])
+            ps_levels = list(feats[1])
             b = pd_levels[0].shape[0]
 
-            # Reshape to (B, C, H*W) then concat along spatial dimension, then to (B, H*W_all, C)
             pd_levels = [x.view(b, self.reg_max * 4, -1) for x in pd_levels]
             ps_levels = [x.view(b, self.nc,           -1) for x in ps_levels]
 
             pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
             pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, nc)
 
-            # For anchors/imgsz we need per-level feature tensors with spatial dims:
-            feats_for_anchors = [x[0] for x in feats]  # use the dist branch to read H,W
+            # Anchor shapes should match per-level feature maps -> use dist branch
+            feats_for_anchors = feats[0]
             first_feat = feats_for_anchors[0]
 
-        # Case B: old style list of tensors, channels already contain both dist and scores
+        # Layout 2: list-of-pairs per level => [(pd_l3, ps_l3), (pd_l4, ps_l4), (pd_l5, ps_l5)]
+        elif (isinstance(feats, (list, tuple))
+              and len(feats) > 0
+              and isinstance(feats[0], (list, tuple))
+              and torch.is_tensor(feats[0][0])):
+            pd_levels = [x[0] for x in feats]
+            ps_levels = [x[1] for x in feats]
+            b = pd_levels[0].shape[0]
+
+            pd_levels = [x.view(b, self.reg_max * 4, -1) for x in pd_levels]
+            ps_levels = [x.view(b, self.nc,           -1) for x in ps_levels]
+
+            pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()
+            pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()
+
+            feats_for_anchors = pd_levels  # NOTE: these are reshaped; use original tensors instead:
+            feats_for_anchors = [x[0] for x in feats]  # original per-level dist tensors
+            first_feat = feats_for_anchors[0]
+
+        # Layout 3: old style list of fused tensors (channels include dist+cls)
         else:
             b = feats[0].shape[0]
             cat = torch.cat([xi.view(b, self.no, -1) for xi in feats], 2)
@@ -197,6 +219,7 @@ class ComputeLoss:
 
             feats_for_anchors = feats
             first_feat = feats[0]
+
 
         # From here on, the shapes are unified
         dtype = pred_scores.dtype
