@@ -106,6 +106,9 @@ class BboxLoss(nn.Module):
 class ComputeLoss:
     # Compute losses
     def __init__(self, model, use_dfl=True):
+        """Robust loss for TAL heads supporting multiple output layouts.
+        Normalizes head outputs so that pred_scores=(B,A,nc), pred_distri=(B,A,4*nbins)
+        and expands anchors by na for consistent assignment/training."""
         device = next(model.parameters()).device  # get model device
         h = model.hyp  # hyperparameters
 
@@ -153,7 +156,7 @@ class ComputeLoss:
                     out[j, :n] = targets[matches, 1:]
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
-    def _infer_na_nbins(self, ch, nc):
+    def _infer_na_nbins(self, ch: int, nc: int) -> tuple[int, int]:
         # Solve ch = na * (4*nbins + nc)
         # Try reasonable ranges: na in [1..9], nbins in [8..64]
         for na in range(1, 13):  # a bit generous
@@ -168,28 +171,28 @@ class ComputeLoss:
         nbins = (ch - nc) // 4 if (ch - nc) % 4 == 0 else None
         if nbins is not None and 8 <= nbins <= 64:
             return 1, nbins
-        raise RuntimeError(f"Cannot infer (na, nbins) from channels={ch}, nc={nc}.")
+        raise ValueError(f"Cannot infer (na, nbins) from channels={ch}, nc={nc}.")
 
-    def bbox_decode(self, anchor_points, pred_dist):
+    def bbox_decode(self, anchor_points: torch.Tensor, pred_dist: torch.Tensor) -> torch.Tensor:
         b, a, c = pred_dist.shape  # (B, HW, 4*nbins)
         if self.use_dfl:
             nbins = c // 4
             # lazily (re)build proj if needed
-            if (self.proj is None or
-                self.proj.numel() != nbins or
-                self.proj.device != pred_dist.device):
-                self.proj = torch.arange(nbins, device=pred_dist.device).float()
-            pred_dist = pred_dist.view(b, a, 4, nbins).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            if (self.proj is None or self.proj.numel() != nbins
+                or self.proj.device != pred_dist.device
+                or self.proj.dtype != pred_dist.dtype):
+                self.proj = torch.arange(nbins, device=pred_dist.device, dtype=pred_dist.dtype)
+            pred_dist = pred_dist.view(b, a, 4, nbins).softmax(dim=3).matmul(self.proj)
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def __call__(self, p, targets, img=None, epoch=0):
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
 
         # p can be (pred, aux) tuple; keep original behavior
-        feats = p[1] if isinstance(p, tuple) else p
+        feats = p[1] if isinstance(p, tuple) else p  # support (pred, aux) tuples
 
         # --- Normalize outputs and build pred_distri / pred_scores robustly ---
-        # Layout 1: tuple-of-lists => ([pd_l3,pd_l4,pd_l5], [ps_l3,ps_l4,ps_l5])
+        # Layout 1: ([pd_l*], [ps_l*]) where pd_l=(B,4*nbins*na,H,W), ps_l=(B,nc*na,H,W)
         if (isinstance(feats, (list, tuple))
             and len(feats) == 2
             and isinstance(feats[0], (list, tuple))
@@ -211,9 +214,11 @@ class ComputeLoss:
                 _, chc, _, _ = ps_lvl.shape
 
                 na = chc // self.nc
-                assert na > 0 and chc == na * self.nc, f"[L1] cls channels {chc} not divisible by nc={self.nc}"
+                if na <= 0 or chc != na * self.nc:
+                    raise ValueError(f"[L1] cls channels {chc} not divisible by nc={self.nc}")
                 nbins = chd // (4 * na)
-                assert 4 * nbins * na == chd, f"[L1] dist channels {chd} not divisible by 4*na={4*na}"
+                if 4 * nbins * na != chd:
+                    raise ValueError(f"[L1] dist channels {chd} not divisible by 4*na={4*na}")
 
                 # (B, HW*na, ...)
                 dist = pd_lvl.view(b, na, 4*nbins, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, 4*nbins)
@@ -233,7 +238,7 @@ class ComputeLoss:
             feats_for_anchors = pd_src_levels
             first_feat = feats_for_anchors[0]
 
-        # Layout 2: list-of-pairs per level => [(pd_l3, ps_l3), (pd_l4, ps_l4), (pd_l5, ps_l5)]
+        # Layout 2: [(pd_l, ps_l)] pairs
         elif (isinstance(feats, (list, tuple))
             and len(feats) > 0
             and isinstance(feats[0], (list, tuple))
@@ -249,7 +254,8 @@ class ComputeLoss:
                 _, chc, _, _ = ps_lvl.shape
 
                 na = chc // self.nc
-                assert na > 0 and chc == na * self.nc, f"cls channels {chc} not divisible by nc={self.nc}"
+                if na <= 0 or chc != na * self.nc:
+                    raise ValueError(f"[L2] cls channels {chc} not divisible by nc={self.nc}")
 
                 nbins = chd // (4 * na)
                 assert nbins * 4 * na == chd, f"dist channels {chd} not divisible by 4*na={4*na}"
@@ -273,11 +279,10 @@ class ComputeLoss:
             first_feat = feats_for_anchors[0]
 
 
-        # Layout 3: old style list of fused tensors (channels include dist+cls)
         else:
-            # ----- Adaptive Case B: each level is a single tensor with anchors packed in channels -----
+            # Layout 3: fused per-level tensors with (dist+cls) in channels
             b = feats[0].shape[0]
-            pd_list, ps_list = []
+            pd_list, ps_list = [], []
             na_per_level, hw_per_level, nbins_per_level = [], [], []
 
             for xi in feats:
@@ -286,7 +291,8 @@ class ComputeLoss:
                 na, nbins = self._infer_na_nbins(ch, self.nc)   # <- parse anchors & bins
                 c_dist = 4 * nbins * na
                 c_cls  = self.nc * na
-                assert c_dist + c_cls == ch, "channel split mismatch"
+                if c_dist + c_cls != ch:
+                    raise ValueError("channel split mismatch")
 
                 # split channels
                 dist = xi[:, :c_dist, :, :]   # (B, 4*nbins*na, H, W)
@@ -313,7 +319,7 @@ class ComputeLoss:
         # From here on, the shapes are unified
         dtype = pred_scores.dtype
         batch_size, grid_size = pred_scores.shape[:2]
-        imgsz = torch.tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
+        imgsz = torch.as_tensor(first_feat.shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # (h,w)
         anchor_points, stride_tensor = make_anchors(feats_for_anchors, self.stride, 0.5)
         
         B = pred_scores.shape[0]
@@ -338,6 +344,8 @@ class ComputeLoss:
         for lvl, feat in enumerate(feats_for_anchors):
             h, w = feat.shape[2], feat.shape[3]
             hw = h * w
+            if hw == 0:
+                continue
 
             ap_lvl, st_lvl = _slice_level(anchor_points, stride_tensor, offset, hw)
             offset += hw
@@ -359,6 +367,8 @@ class ComputeLoss:
                 st_slices.append(st_lvl)  # (B, HW*na, 1)
 
         # Concatenate and ensure (B, sum(HW*na), *)
+        if len(ap_slices) == 0:
+            raise ValueError("No valid feature levels for anchors.")
         if ap_slices[0].dim() == 2:
             # stack to batch
             anchor_points = torch.cat(ap_slices, dim=0).unsqueeze(0).expand(B, -1, -1)
@@ -376,8 +386,10 @@ class ComputeLoss:
         if self.use_dfl:
             # infer nbins from concatenated pred_distri (it’s levelwise-consistent within each row)
             nbins = pred_distri.shape[-1] // 4
-            if self.proj is None or self.proj.numel() != nbins or self.proj.device != pred_distri.device:
-                self.proj = torch.arange(nbins, device=pred_distri.device).float()
+            if (self.proj is None or self.proj.numel() != nbins
+                or self.proj.device != pred_distri.device
+                or self.proj.dtype != pred_distri.dtype):
+                self.proj = torch.arange(nbins, device=pred_distri.device, dtype=pred_distri.dtype)
             if self.bbox_loss.reg_max != nbins - 1:
                 self.bbox_loss.reg_max = nbins - 1
 
