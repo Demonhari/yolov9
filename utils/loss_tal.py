@@ -213,22 +213,43 @@ class ComputeLoss:
 
         # Layout 2: list-of-pairs per level => [(pd_l3, ps_l3), (pd_l4, ps_l4), (pd_l5, ps_l5)]
         elif (isinstance(feats, (list, tuple))
-              and len(feats) > 0
-              and isinstance(feats[0], (list, tuple))
-              and torch.is_tensor(feats[0][0])):
-            pd_levels = [x[0] for x in feats]
-            ps_levels = [x[1] for x in feats]
-            b = pd_levels[0].shape[0]
+            and len(feats) > 0
+            and isinstance(feats[0], (list, tuple))
+            and torch.is_tensor(feats[0][0])):
+            pd_list, ps_list = [], []
+            na_per_level, hw_per_level, nbins_per_level = [], [], []
 
-            pd_levels = [x.view(b, x.shape[1], -1) for x in pd_levels]
-            ps_levels = [x.view(b, x.shape[1], -1) for x in ps_levels]
+            b = feats[0][0].shape[0]
+            for (pd_lvl, ps_lvl) in feats:
+                # pd_lvl: (B, 4*nbins*na, H, W)
+                # ps_lvl: (B, nc*na,      H, W)
+                _, chd, h, w = pd_lvl.shape
+                _, chc, _, _ = ps_lvl.shape
 
-            pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()
-            pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()
+                na = chc // self.nc
+                assert na > 0 and chc == na * self.nc, f"cls channels {chc} not divisible by nc={self.nc}"
 
-            feats_for_anchors = pd_levels  # NOTE: these are reshaped; use original tensors instead:
-            feats_for_anchors = [x[0] for x in feats]  # original per-level dist tensors
+                nbins = chd // (4 * na)
+                assert nbins * 4 * na == chd, f"dist channels {chd} not divisible by 4*na={4*na}"
+
+                # reshape to (B, HW*na, …)
+                dist = pd_lvl.view(b, na, 4*nbins, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, 4*nbins)
+                cls  = ps_lvl.view(b, na, self.nc, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, self.nc)
+
+                pd_list.append(dist)
+                ps_list.append(cls)
+
+                na_per_level.append(na)
+                hw_per_level.append(h * w)
+                nbins_per_level.append(nbins)
+
+            pred_distri = torch.cat(pd_list, dim=1)   # (B, sum(HW*na), 4*nbins_levelwise)
+            pred_scores = torch.cat(ps_list, dim=1)   # (B, sum(HW*na), nc)
+
+            # Use the original per-level dist tensors for anchor shapes
+            feats_for_anchors = [x[0] for x in feats]
             first_feat = feats_for_anchors[0]
+
 
         # Layout 3: old style list of fused tensors (channels include dist+cls)
         else:
@@ -341,8 +362,8 @@ class ComputeLoss:
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
-        ap_assign = anchor_points if anchor_points.dim() == 2 else anchor_points[0]      # (A, 2)
-        st_assign = stride_tensor if stride_tensor.dim() == 2 else stride_tensor[0]      # (A, 1)
+        ap_assign = anchor_points if anchor_points.dim() == 2 else anchor_points[0]  # (A, 2)
+        st_assign = stride_tensor if stride_tensor.dim() == 2 else stride_tensor[0]  # (A, 1)
 
         target_labels, target_bboxes, target_scores, fg_mask = self.assigner(
             pred_scores.detach().sigmoid(),                                  # (B, A, nc)
