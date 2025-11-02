@@ -341,13 +341,17 @@ class ComputeLoss:
 
         pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (b, h*w, 4)
 
+        ap_assign = anchor_points if anchor_points.dim() == 2 else anchor_points[0]      # (A, 2)
+        st_assign = stride_tensor if stride_tensor.dim() == 2 else stride_tensor[0]      # (A, 1)
+
         target_labels, target_bboxes, target_scores, fg_mask = self.assigner(
-            pred_scores.detach().sigmoid(),
-            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
-            anchor_points * stride_tensor,
-            gt_labels,
-            gt_bboxes,
-            mask_gt)
+            pred_scores.detach().sigmoid(),                                  # (B, A, nc)
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),    # (B, A, 4) in pixels
+            ap_assign * st_assign,                                           # (A, 2) in pixels
+            gt_labels,                                                       # (B, N, 1)
+            gt_bboxes,                                                       # (B, N, 4) xyxy in pixels
+            mask_gt                                                          # (B, N, 1)
+        )
 
         target_bboxes /= stride_tensor
         target_scores_sum = max(target_scores.sum(), 1)
