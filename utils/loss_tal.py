@@ -196,19 +196,41 @@ class ComputeLoss:
             and isinstance(feats[1], (list, tuple))
             and torch.is_tensor(feats[0][0])
             and torch.is_tensor(feats[1][0])):
-            pd_levels = list(feats[0])
-            ps_levels = list(feats[1])
-            b = pd_levels[0].shape[0]
 
-            pd_levels = [x.view(b, x.shape[1], -1) for x in pd_levels]  # use real C
-            ps_levels = [x.view(b, x.shape[1], -1) for x in ps_levels]  # use real C (should be nc)
+            pd_src_levels = list(feats[0])  # original tensors for anchors
+            ps_src_levels = list(feats[1])
+            b = pd_src_levels[0].shape[0]
 
+            pd_list, ps_list = [], []
+            na_per_level, hw_per_level, nbins_per_level = [], [], []
 
-            pred_distri = torch.cat(pd_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, 4*reg_max)
-            pred_scores = torch.cat(ps_levels, 2).permute(0, 2, 1).contiguous()  # (B, HW, nc)
+            for pd_lvl, ps_lvl in zip(pd_src_levels, ps_src_levels):
+                # pd_lvl: (B, 4*nbins*na, H, W)
+                # ps_lvl: (B, nc*na,      H, W)
+                _, chd, h, w = pd_lvl.shape
+                _, chc, _, _ = ps_lvl.shape
 
-            # Anchor shapes should match per-level feature maps -> use dist branch
-            feats_for_anchors = feats[0]
+                na = chc // self.nc
+                assert na > 0 and chc == na * self.nc, f"[L1] cls channels {chc} not divisible by nc={self.nc}"
+                nbins = chd // (4 * na)
+                assert 4 * nbins * na == chd, f"[L1] dist channels {chd} not divisible by 4*na={4*na}"
+
+                # (B, HW*na, ...)
+                dist = pd_lvl.view(b, na, 4*nbins, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, 4*nbins)
+                cls  = ps_lvl.view(b, na, self.nc, h*w).permute(0, 3, 1, 2).contiguous().view(b, h*w*na, self.nc)
+
+                pd_list.append(dist)
+                ps_list.append(cls)
+
+                na_per_level.append(na)
+                hw_per_level.append(h * w)
+                nbins_per_level.append(nbins)
+
+            pred_distri = torch.cat(pd_list, dim=1)  # (B, sum(HW*na), 4*nbins_levelwise)
+            pred_scores = torch.cat(ps_list, dim=1)  # (B, sum(HW*na), nc)
+
+            # Use the original dist tensors to derive H,W per level later
+            feats_for_anchors = pd_src_levels
             first_feat = feats_for_anchors[0]
 
         # Layout 2: list-of-pairs per level => [(pd_l3, ps_l3), (pd_l4, ps_l4), (pd_l5, ps_l5)]
